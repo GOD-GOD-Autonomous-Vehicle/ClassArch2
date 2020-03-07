@@ -12,6 +12,8 @@ import os
 import h5py
 import subprocess
 import shlex
+import math
+import faiss 
 
 BASE_DIR = './'
 
@@ -29,7 +31,7 @@ def _load_data_file(name):
 
 
 class ModelNet40(data.Dataset):
-    def __init__(self, num_points, transforms=None, split='train', download=True):
+    def __init__(self, num_points, transforms=None, split='train', download=False):
         super().__init__()
 
         self.transforms = transforms
@@ -92,6 +94,121 @@ class ModelNet40(data.Dataset):
         pass
 
 
+
+class ModelNet40_SONet(data.Dataset):
+    def __init__(self, root, mode, opt, transforms=None):
+        super().__init__()
+        self.root = root
+        self.opt = opt
+        self.mode = mode
+        self.transforms = transforms
+
+        self.dataset = []
+        rows = round(math.sqrt(opt.node_num))
+        cols = rows
+
+        f = open(os.path.join(root, 'shape_names.txt'))
+        shape_list = [str.rstrip() for str in f.readlines()]
+        f.close()
+
+        if 'train' == mode:
+            f = open(os.path.join(root, 'train_files.txt'), 'r')
+            lines = [str.rstrip() for str in f.readlines()]
+            f.close()
+        elif 'test' == mode:
+            f = open(os.path.join(root, 'test_files.txt'), 'r')
+            lines = [str.rstrip() for str in f.readlines()]
+            f.close()
+        elif 'unlabeled' == mode:
+            f = open(os.path.join(root, 'unlabeled_files.txt'), 'r')
+            lines = [str.rstrip() for str in f.readlines()]
+            f.close()
+        elif 'train_stu' == mode:
+            f = open(os.path.join(root, 'train_stu_files.txt'), 'r')
+            lines = [str.rstrip() for str in f.readlines()]
+            f.close()
+        else:
+            raise Exception('Network mode error.')
+
+        for i, name in enumerate(lines):
+            # locate the folder name
+            folder = name[0:-5]
+            file_name = name
+
+            # get the label
+            label = shape_list.index(folder)
+
+            # som node locations
+            som_nodes_folder = '%dx%d_som_nodes' % (rows, cols)
+
+            item = (os.path.join(root, mode, folder, file_name + '.npy'),
+                    label,
+                    os.path.join(root, mode, som_nodes_folder, folder, file_name + '.npy'))
+            self.dataset.append(item)
+
+        # kNN search on SOM nodes
+        self.knn_builder = KNNBuilder(self.opt.som_k)
+
+        # farthest point sample
+        self.fathest_sampler = FarthestSampler()
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        if self.opt.dataset == 'modelnet':
+            pc_np_file, class_id, som_node_np_file = self.dataset[index]
+
+            data = np.load(pc_np_file)
+            data = data[np.random.choice(data.shape[0], self.opt.input_pc_num, replace=False), :]
+
+            pc_np = data[:, 0:3]  # Nx3
+            surface_normal_np = data[:, 3:6]  # Nx3
+            som_node_np = np.load(som_node_np_file)  # node_numx3
+            
+        elif self.opt.dataset == 'shrec':
+            npz_file, class_id = self.dataset[index]
+            data = np.load(npz_file)
+
+            pc_np = data['pc']
+            surface_normal_np = data['sn']
+            som_node_np = data['som_node']
+
+            # random choice
+            choice_idx = np.random.choice(pc_np.shape[0], self.opt.input_pc_num, replace=False)
+            pc_np = pc_np[choice_idx, :]
+            surface_normal_np = surface_normal_np[choice_idx, :]
+        else:
+            raise Exception('Dataset incorrect.')
+
+        # if self.transforms is not None: # Need to be fixed
+        #     pc_np = self.transforms(pc_np)
+
+        # convert to tensor
+        pc = torch.from_numpy(pc_np.transpose().astype(np.float32))  # 3xN
+
+        # surface normal
+        surface_normal = torch.from_numpy(surface_normal_np.transpose().astype(np.float32))  # 3xN
+
+        # som
+        som_node = torch.from_numpy(som_node_np.transpose().astype(np.float32))  # 3xnode_num
+
+        # kNN search: som -> som
+        if self.opt.som_k >= 2:
+            D, I = self.knn_builder.self_build_search(som_node_np)
+            som_knn_I = torch.from_numpy(I.astype(np.int64))  # node_num x som_k
+        else:
+            som_knn_I = torch.from_numpy(np.arange(start=0, stop=self.opt.node_num, dtype=np.int64).reshape((self.opt.node_num, 1)))  # node_num x 1
+
+        # print(som_node_np)
+        # print(D)
+        # print(I)
+        # assert False
+        
+        return pc, surface_normal, class_id, som_node, som_knn_I
+
+
+
 class UnlabeledModelNet40(data.Dataset):
     def __init__(self, num_points, root, transforms=None, split='unlabeled'):
         super().__init__()
@@ -126,4 +243,59 @@ class UnlabeledModelNet40(data.Dataset):
 
     def __len__(self):
         return self.points.shape[0]
+
+
+
+class KNNBuilder:
+    def __init__(self, k):
+        self.k = k
+        self.dimension = 3
+
+    def build_nn_index(self, database):
+        '''
+        :param database: numpy array of Nx3
+        :return: Faiss index, in CPU
+        '''
+        index = faiss.IndexFlatL2(self.dimension)  # dimension is 3
+        index.add(database)
+        return index
+
+    def search_nn(self, index, query, k):
+        '''
+        :param index: Faiss index
+        :param query: numpy array of Nx3
+        :return: D: numpy array of Nxk
+                 I: numpy array of Nxk
+        '''
+        D, I = index.search(query, k)
+        return D, I
+
+    def self_build_search(self, x):
+        '''
+
+        :param x: numpy array of Nxd
+        :return: D: numpy array of Nxk
+                 I: numpy array of Nxk
+        '''
+        x = np.ascontiguousarray(x, dtype=np.float32)
+        index = self.build_nn_index(x)
+        D, I = self.search_nn(index, x, self.k)
+        return D, I
+
+
+class FarthestSampler:
+    def __init__(self):
+        pass
+
+    def calc_distances(self, p0, points):
+        return ((p0 - points) ** 2).sum(axis=1)
+
+    def sample(self, pts, k):
+        farthest_pts = np.zeros((k, 3))
+        farthest_pts[0] = pts[np.random.randint(len(pts))]
+        distances = self.calc_distances(farthest_pts[0], pts)
+        for i in range(1, k):
+            farthest_pts[i] = pts[np.argmax(distances)]
+            distances = np.minimum(distances, self.calc_distances(farthest_pts[i], pts))
+        return farthest_pts
 
